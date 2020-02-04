@@ -3460,14 +3460,17 @@ var jsonata = (function() {
             case 'lambda':
                 result = evaluateLambda(expr, input, environment);
                 break;
-            case 'partial':
-                result = yield * evaluatePartialApplication(expr, input, environment);
-                break;
             case 'apply':
                 result = yield * evaluateApplyExpression(expr, input, environment);
                 break;
             case 'transform':
                 result = evaluateTransformExpression(expr, input, environment);
+                break;
+            case 'placeholder':
+                var body = {value: "_jsonata_0", type: "variable"};
+                var args = [body];
+                result = evaluateLambda({arguments: args, body: body}, input, environment);
+                result.placeholder = true;
                 break;
         }
 
@@ -3805,6 +3808,22 @@ var jsonata = (function() {
         return results;
     }
 
+    function mergePlaceholders(lambda, placeholders) {
+        var result = lambda;
+        // if either is not a placeholder, then partially apply the function
+        if(placeholders[0] !== placeholder) {
+            result = partialApplyProcedure(result, [placeholders[0], {type: 'operator', value: '?'}]);
+        } else if(placeholders[1] !== placeholder) {
+            result = partialApplyProcedure(result, [{type: 'operator', value: '?'}, placeholders[1]]);
+        }
+        result.placeholder = true;
+        return result;
+    }
+
+    function isPlaceholder(val) {
+        return val && val.placeholder;
+    }
+
     /**
      * Evaluate binary expression against input data
      * @param {Object} expr - JSONata expression
@@ -3813,9 +3832,34 @@ var jsonata = (function() {
      * @returns {*} Evaluated input data
      */
     function * evaluateBinary(expr, input, environment) {
-        var result;
-        var lhs = yield * evaluate(expr.lhs, input, environment);
-        var rhs = yield * evaluate(expr.rhs, input, environment);
+        let result;
+        const lhs = yield * evaluate(expr.lhs, input, environment);
+        const rhs = yield * evaluate(expr.rhs, input, environment);
+
+        // if either or both is a placeholder, then create and return a lambda
+        if(isPlaceholder(lhs) || isPlaceholder(rhs)) {
+            const body = {type: 'binary', value: expr.value};
+            const args = [];
+            if(isPlaceholder(lhs)) {
+                Array.prototype.push.apply(args, lhs.arguments);
+                body.lhs = lhs.body;
+            } else {
+                body.lhs = {type: 'value', value: lhs};
+            }
+            if(isPlaceholder(rhs)) {
+                Array.prototype.push.apply(args, rhs.arguments);
+                body.rhs = rhs.body;
+            } else {
+                body.rhs = {type: 'value', value: rhs};
+            }
+            for(let ii = 0; ii < args.length; ii++) {
+                args[ii].value = '_jsonata_' + ii;
+            }
+            result = evaluateLambda({arguments: args, body: body}, input, environment);
+            result.placeholder = true;
+            return result;
+        }
+
         var op = expr.value;
 
         try {
@@ -3867,7 +3911,7 @@ var jsonata = (function() {
      * @returns {*} Evaluated input data
      */
     function* evaluateUnary(expr, input, environment) {
-        var result;
+        let result;
 
         switch (expr.value) {
             case '-':
@@ -3889,9 +3933,9 @@ var jsonata = (function() {
             case '[':
                 // array constructor - evaluate each item
                 result = [];
-                for(var ii = 0; ii < expr.expressions.length; ii++) {
-                    var item = expr.expressions[ii];
-                    var value = yield * evaluate(item, input, environment);
+                for(let ii = 0; ii < expr.expressions.length; ii++) {
+                    const item = expr.expressions[ii];
+                    const value = yield * evaluate(item, input, environment);
                     if (typeof value !== 'undefined') {
                         if(item.value === '[') {
                             result.push(value);
@@ -3907,10 +3951,50 @@ var jsonata = (function() {
                         value: true
                     });
                 }
+                // if any of the values are placeholder, then merge and pull up
+                if(result.some(value => isPlaceholder(value))) {
+                    const body = {type: 'unary', value: expr.value, expressions: []};
+                    const args = [];
+                    for(let vii = 0; vii < result.length; vii++) {
+                        const value = result[vii];
+                        if(isPlaceholder(value)) {
+                            Array.prototype.push.apply(args, value.arguments);
+                            body.expressions.push(value.body);
+                        } else {
+                            body.expressions.push({type: 'value', value: value});
+                        }
+                    }
+                    for(let aii = 0; aii < args.length; aii++) {
+                        args[aii].value = '_jsonata_' + aii;
+                    }
+                    result = evaluateLambda({arguments: args, body: body}, input, environment);
+                    result.placeholder = true;
+                }
                 break;
             case '{':
                 // object constructor - apply grouping
                 result = yield * evaluateGroupExpression(expr, input, environment);
+                // if any of the values are placeholder, then merge and pull up
+                if(Object.values(result).some(value => isPlaceholder(value))) {
+                    const body = {type: 'unary', value: '{', lhs: []};
+                    const args = [];
+                    const entries = Object.entries(result);
+                    for(let vii = 0; vii < entries.length; vii++) {
+                        const entry =  entries[vii];
+                        const value = entry[1];
+                        if(isPlaceholder(value)) {
+                            Array.prototype.push.apply(args, value.arguments);
+                            body.lhs.push([{type: 'value', value: entry[0]}, value.body]);
+                        } else {
+                            body.lhs.push([{type: 'value', value: entry[0]}, {type: 'value', value: value}]);
+                        }
+                    }
+                    for(let aii = 0; aii < args.length; aii++) {
+                        args[aii].value = '_jsonata_' + aii;
+                    }
+                    result = evaluateLambda({arguments: args, body: body}, input, environment);
+                    result.placeholder = true;
+                }
                 break;
 
         }
@@ -4702,7 +4786,6 @@ var jsonata = (function() {
     function* evaluateApplyExpression(expr, input, environment) {
         var result;
 
-
         var lhs = yield * evaluate(expr.lhs, input, environment);
         if(expr.rhs.type === 'function') {
             // this is a function _invocation_; invoke it with lhs expression as the first argument
@@ -4749,24 +4832,22 @@ var jsonata = (function() {
         // evaluate it generically first, then check that it is a function.  Throw error if not.
         var proc = yield * evaluate(expr.procedure, input, environment);
 
-        if (typeof proc === 'undefined' && expr.procedure.type === 'path' && environment.lookup(expr.procedure.steps[0].value)) {
-            // help the user out here if they simply forgot the leading $
-            throw {
-                code: "T1005",
-                stack: (new Error()).stack,
-                position: expr.position,
-                token: expr.procedure.steps[0].value
-            };
-        }
-
-        var evaluatedArgs = [];
+        let hasPlaceholder = false;
+        const evaluatedArgs = [];
+        let expectsFunction = proc && proc.signature && proc.signature.getType(evaluatedArgs.length) == 'f';
         if(typeof applyto !== 'undefined') {
             evaluatedArgs.push(applyto.context);
+            hasPlaceholder = isPlaceholder(applyto.context);
+
         }
         // eager evaluation - evaluate the arguments
         for (var jj = 0; jj < expr.arguments.length; jj++) {
             const arg = yield* evaluate(expr.arguments[jj], input, environment);
-            if(isFunction(arg)) {
+            expectsFunction = proc && proc.signature && proc.signature.getType(evaluatedArgs.length) == 'f';
+            if(arg && isPlaceholder(arg) && !expectsFunction) {
+                hasPlaceholder = true;
+            }
+            if(isFunction(arg) && (!isPlaceholder(arg) || expectsFunction)) {
                 // wrap this in a closure
                 const closure = function* (...params) {
                     // invoke func
@@ -4777,6 +4858,44 @@ var jsonata = (function() {
             } else {
                 evaluatedArgs.push(arg);
             }
+        }
+
+        if (!isFunction(proc)) {
+            if (expr.procedure.type === 'path' && environment.lookup(expr.procedure.steps[0].value)) {
+                // help the user out here if they simply forgot the leading $
+                throw {
+                    code: hasPlaceholder ? 'T1007' : 'T1005',
+                    stack: (new Error()).stack,
+                    position: expr.position,
+                    token: expr.procedure.steps[0].value
+                };
+            } else {
+                throw {
+                    code: hasPlaceholder ? 'T1008' : 'T1006',
+                    stack: (new Error()).stack,
+                    position: expr.position
+                };
+            }
+        }
+
+        if(hasPlaceholder) {
+            var body = {type: expr.type, value: expr.value, procedure: expr.procedure, arguments: []};
+            var args = [];
+            for(var vii = 0; vii < evaluatedArgs.length; vii++) {
+                var evalarg = evaluatedArgs[vii];
+                if(isPlaceholder(evalarg)) {
+                    Array.prototype.push.apply(args, evalarg.arguments);
+                    body.arguments.push(evalarg.body);
+                } else {
+                    body.arguments.push({type: 'value', value: evalarg});
+                }
+            }
+            for(var aii = 0; aii < args.length; aii++) {
+                args[aii].value = '_jsonata_' + aii;
+            }
+            result = evaluateLambda({arguments: args, body: body}, input, environment);
+            result.placeholder = true;
+            return result;
         }
         // apply the procedure
         var procName = expr.procedure.type === 'path' ? expr.procedure.steps[0].value : expr.procedure.value;
@@ -4841,10 +4960,7 @@ var jsonata = (function() {
     function* applyInner(proc, args, input, environment) {
         var result;
         try {
-            var validatedArgs = args;
-            if (proc) {
-                validatedArgs = validateArguments(proc.signature, args, input);
-            }
+            const validatedArgs = validateArguments(proc.signature, args, input);
 
             if (isLambda(proc)) {
                 result = yield* applyProcedure(proc, validatedArgs);
@@ -4860,7 +4976,7 @@ var jsonata = (function() {
                 if (isIterable(result)) {
                     result = yield* result;
                 }
-            } else if (typeof proc === 'function') {
+            } else {
                 // typically these are functions that are returned by the invocation of plugin functions
                 // the `input` is being passed in as the `this` for the invoked function
                 // this is so that functions that return objects containing functions can chain
@@ -4870,19 +4986,12 @@ var jsonata = (function() {
                 if (isIterable(result)) {
                     result = yield* result;
                 }
-            } else {
-                throw {
-                    code: "T1006",
-                    stack: (new Error()).stack
-                };
             }
         } catch(err) {
-            if(proc) {
-                if (typeof err.token == 'undefined' && typeof proc.token !== 'undefined') {
-                    err.token = proc.token;
-                }
-                err.position = proc.position;
+            if (typeof err.token == 'undefined' && typeof proc.token !== 'undefined') {
+                err.token = proc.token;
             }
+            err.position = proc.position;
             throw err;
         }
         return result;
@@ -4915,54 +5024,6 @@ var jsonata = (function() {
     }
 
     /**
-     * Evaluate partial application
-     * @param {Object} expr - JSONata expression
-     * @param {Object} input - Input data to evaluate against
-     * @param {Object} environment - Environment
-     * @returns {*} Evaluated input data
-     */
-    function* evaluatePartialApplication(expr, input, environment) {
-        // partially apply a function
-        var result;
-        // evaluate the arguments
-        var evaluatedArgs = [];
-        for(var ii = 0; ii < expr.arguments.length; ii++) {
-            var arg = expr.arguments[ii];
-            if (arg.type === 'operator' && arg.value === '?') {
-                evaluatedArgs.push(arg);
-            } else {
-                evaluatedArgs.push(yield * evaluate(arg, input, environment));
-            }
-        }
-        // lookup the procedure
-        var proc = yield * evaluate(expr.procedure, input, environment);
-        if (typeof proc === 'undefined' && expr.procedure.type === 'path' && environment.lookup(expr.procedure.steps[0].value)) {
-            // help the user out here if they simply forgot the leading $
-            throw {
-                code: "T1007",
-                stack: (new Error()).stack,
-                position: expr.position,
-                token: expr.procedure.steps[0].value
-            };
-        }
-        if (isLambda(proc)) {
-            result = partialApplyProcedure(proc, evaluatedArgs);
-        } else if (proc && proc._jsonata_function === true) {
-            result = partialApplyNativeFunction(proc.implementation, evaluatedArgs);
-        } else if (typeof proc === 'function') {
-            result = partialApplyNativeFunction(proc, evaluatedArgs);
-        } else {
-            throw {
-                code: "T1008",
-                stack: (new Error()).stack,
-                position: expr.position,
-                token: expr.procedure.type === 'path' ? expr.procedure.steps[0].value : expr.procedure.value
-            };
-        }
-        return result;
-    }
-
-    /**
      * Validate the arguments against the signature validator (if it exists)
      * @param {Function} signature - validator function
      * @param {Array} args - function arguments
@@ -4987,102 +5048,15 @@ var jsonata = (function() {
     function* applyProcedure(proc, args) {
         var result;
         var env = createFrame(proc.environment);
+        env.bind('0', args);
+        args.forEach(function(arg, index) {
+           env.bind('' + (index + 1), arg);
+        });
         proc.arguments.forEach(function (param, index) {
             env.bind(param.value, args[index]);
         });
-        if (typeof proc.body === 'function') {
-            // this is a lambda that wraps a native function - generated by partially evaluating a native
-            result = yield * applyNativeFunction(proc.body, env);
-        } else {
-            result = yield * evaluate(proc.body, proc.input, env);
-        }
+        result = yield * evaluate(proc.body, proc.input, env);
         return result;
-    }
-
-    /**
-     * Partially apply procedure
-     * @param {Object} proc - Procedure
-     * @param {Array} args - Arguments
-     * @returns {{lambda: boolean, input: *, environment: {bind, lookup}, arguments: Array, body: *}} Result of partially applied procedure
-     */
-    function partialApplyProcedure(proc, args) {
-        // create a closure, bind the supplied parameters and return a function that takes the remaining (?) parameters
-        var env = createFrame(proc.environment);
-        var unboundArgs = [];
-        proc.arguments.forEach(function (param, index) {
-            var arg = args[index];
-            if (arg && arg.type === 'operator' && arg.value === '?') {
-                unboundArgs.push(param);
-            } else {
-                env.bind(param.value, arg);
-            }
-        });
-        var procedure = {
-            _jsonata_lambda: true,
-            input: proc.input,
-            environment: env,
-            arguments: unboundArgs,
-            body: proc.body
-        };
-        return procedure;
-    }
-
-    /**
-     * Partially apply native function
-     * @param {Function} native - Native function
-     * @param {Array} args - Arguments
-     * @returns {{lambda: boolean, input: *, environment: {bind, lookup}, arguments: Array, body: *}} Result of partially applying native function
-     */
-    function partialApplyNativeFunction(native, args) {
-        // create a lambda function that wraps and invokes the native function
-        // get the list of declared arguments from the native function
-        // this has to be picked out from the toString() value
-        var sigArgs = getNativeFunctionArguments(native);
-        sigArgs = sigArgs.map(function (sigArg) {
-            return '$' + sigArg.trim();
-        });
-        var body = 'function(' + sigArgs.join(', ') + '){ _ }';
-
-        var bodyAST = parser(body);
-        bodyAST.body = native;
-
-        var partial = partialApplyProcedure(bodyAST, args);
-        return partial;
-    }
-
-    /**
-     * Apply native function
-     * @param {Object} proc - Procedure
-     * @param {Object} env - Environment
-     * @returns {*} Result of applying native function
-     */
-    function* applyNativeFunction(proc, env) {
-        var sigArgs = getNativeFunctionArguments(proc);
-        // generate the array of arguments for invoking the function - look them up in the environment
-        var args = sigArgs.map(function (sigArg) {
-            return env.lookup(sigArg.trim());
-        });
-
-        var focus = {
-            environment: env
-        };
-        var result = proc.apply(focus, args);
-        if(isIterable(result)) {
-            result = yield * result;
-        }
-        return result;
-    }
-
-    /**
-     * Get native function arguments
-     * @param {Function} func - Function
-     * @returns {*|Array} Native function arguments
-     */
-    function getNativeFunctionArguments(func) {
-        var signature = func.toString();
-        var sigParens = /\(([^)]*)\)/.exec(signature)[1]; // the contents of the parens
-        var sigArgs = sigParens.split(',');
-        return sigArgs;
     }
 
     /**
@@ -5560,8 +5534,8 @@ const parser = (() => {
         'or': 25,
         'in': 40,
         '&': 50,
-        '!': 0,   // not an operator, but needed as a stop character for name tokens
-        '~': 0   // not an operator, but needed as a stop character for name tokens
+        '~': 90,
+        '!': 0   // not an operator, but needed as a stop character for name tokens
     };
 
     var escapes = {  // JSON string escape sequences - see json.org
@@ -6002,8 +5976,8 @@ const parser = (() => {
         // match infix operators
         // <expression> <operator> <expression>
         // left associative
-        var infix = function (id, bp, led) {
-            var bindingPower = bp || operators[id];
+        var infix = function (id, led) {
+            var bindingPower = operators[id];
             var s = symbol(id, bindingPower);
             s.led = led || function (left) {
                 this.lhs = left;
@@ -6095,22 +6069,28 @@ const parser = (() => {
             return this;
         });
 
+        // lambda shortcut
+        prefix("~", function () {
+            this.type = 'lambda';
+            this.arguments = [
+                {type: 'variable', value: '1'},
+                {type: 'variable', value: '2'},
+                {type: 'variable', value: '3'},
+                {type: 'variable', value: '4'}
+            ];
+            this.body = expression(operators['~']);
+            return this;
+        });
+
         // function invocation
-        infix("(", operators['('], function (left) {
+        infix("(", function (left) {
             // left is is what we are trying to invoke
             this.procedure = left;
             this.type = 'function';
             this.arguments = [];
             if (node.id !== ')') {
                 for (; ;) {
-                    if (node.type === 'operator' && node.id === '?') {
-                        // partial function application
-                        this.type = 'partial';
-                        this.arguments.push(node);
-                        advance('?');
-                    } else {
-                        this.arguments.push(expression(0));
-                    }
+                    this.arguments.push(expression(0));
                     if (node.id !== ',') break;
                     advance(',');
                 }
@@ -6205,7 +6185,7 @@ const parser = (() => {
         });
 
         // filter - predicate or array index
-        infix("[", operators['['], function (left) {
+        infix("[", function (left) {
             if (node.id === "]") {
                 // empty predicate means maintain singleton arrays in the output
                 var step = left;
@@ -6225,7 +6205,7 @@ const parser = (() => {
         });
 
         // order-by
-        infix("^", operators['^'], function (left) {
+        infix("^", function (left) {
             advance("(");
             var terms = [];
             for (; ;) {
@@ -6288,7 +6268,7 @@ const parser = (() => {
         prefix("{", objectParser);
 
         // object grouping
-        infix("{", operators['{'], objectParser);
+        infix("{", objectParser);
 
         // bind variable
         infixr(":=", operators[':='], function (left) {
@@ -6307,7 +6287,7 @@ const parser = (() => {
         });
 
         // focus variable bind
-        infix("@", operators['@'], function (left) {
+        infix("@", function (left) {
             this.lhs = left;
             this.rhs = expression(operators['@']);
             if(this.rhs.type !== 'variable') {
@@ -6323,7 +6303,7 @@ const parser = (() => {
         });
 
         // index (position) variable bind
-        infix("#", operators['#'], function (left) {
+        infix("#", function (left) {
             this.lhs = left;
             this.rhs = expression(operators['#']);
             if(this.rhs.type !== 'variable') {
@@ -6339,7 +6319,7 @@ const parser = (() => {
         });
 
         // if/then/else ternary operator ?:
-        infix("?", operators['?'], function (left) {
+        infix("?", function (left) {
             this.type = 'condition';
             this.condition = left;
             this.then = expression(0);
@@ -6348,6 +6328,12 @@ const parser = (() => {
                 advance(":");
                 this.else = expression(0);
             }
+            return this;
+        });
+
+        // placeholder function
+        prefix("?", function() {
+            this.type = "placeholder";
             return this;
         });
 
@@ -6736,7 +6722,6 @@ const parser = (() => {
                     }
                     break;
                 case 'function':
-                case 'partial':
                     result = {type: expr.type, name: expr.name, value: expr.value, position: expr.position};
                     result.arguments = expr.arguments.map(function (arg) {
                         var argAST = processAST(arg);
@@ -6803,18 +6788,16 @@ const parser = (() => {
                 case 'value':
                 case 'wildcard':
                 case 'descendant':
+                case 'placeholder':
                 case 'variable':
                 case 'regex':
                     result = expr;
                     break;
                 case 'operator':
                     // the tokens 'and' and 'or' might have been used as a name rather than an operator
-                    if (expr.value === 'and' || expr.value === 'or' || expr.value === 'in') {
+                    /* istanbul ignore else */ if (expr.value === 'and' || expr.value === 'or' || expr.value === 'in') {
                         expr.type = 'name';
                         result = processAST(expr);
-                    } else /* istanbul ignore else */ if (expr.value === '?') {
-                        // partial application
-                        result = expr;
                     } else {
                         throw {
                             code: "S0201",
@@ -7112,6 +7095,7 @@ const signature = (() => {
 
         return {
             definition: signature,
+            getType: index => index < params.length ? params[index].type : '',
             validate: function (args, context) {
                 var suppliedSig = '';
                 args.forEach(function (arg) {
@@ -7149,12 +7133,12 @@ const signature = (() => {
                             // may have matched multiple args (if the regex ends with a '+'
                             // split into single tokens
                             match.split('').forEach(function (single) {
+                                arg = args[argIndex];
                                 if (param.type === 'a') {
                                     if (single === 'm') {
                                         // missing (undefined)
                                         arg = undefined;
                                     } else {
-                                        arg = args[argIndex];
                                         var arrayOK = true;
                                         // is there type information on the contents of the array?
                                         if (typeof param.subtype !== 'undefined') {
